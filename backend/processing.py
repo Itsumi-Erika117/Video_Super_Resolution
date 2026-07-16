@@ -45,16 +45,36 @@ logger = logging.getLogger(__name__)
 # --------------- NVIDIA VFX SDK wrapper ---------------
 
 try:
-    import nvidia.vfx as _vfx
+    import nvvfx as _vfx
 
     HAS_NVVFX = True
-    _vfx_available: bool = getattr(_vfx, "is_available", lambda: True)()
 except ImportError:
     HAS_NVVFX = False
     _vfx = None
-    _vfx_available = False
 
-logger.info("NVIDIA VFX SDK available: %s", HAS_NVVFX and _vfx_available)
+# NVVFX SDK requires a GPU array library (CuPy or PyTorch) for DLPack tensors
+try:
+    import cupy as _cp
+
+    HAS_CUPY = True
+except ImportError:
+    _cp = None
+    HAS_CUPY = False
+
+try:
+    import torch as _torch
+
+    HAS_TORCH = True
+except ImportError:
+    _torch = None
+    HAS_TORCH = False
+
+_vfx_available = HAS_NVVFX and (HAS_CUPY or HAS_TORCH)
+
+logger.info(
+    "NVIDIA VFX SDK available: %s (import=%s, cupy=%s, torch=%s)",
+    _vfx_available, HAS_NVVFX, HAS_CUPY, HAS_TORCH,
+)
 
 # --------------- Constants ---------------
 
@@ -63,33 +83,183 @@ READ_CHUNK_SIZE = 1024 * 1024  # 1 MiB for upload streaming
 
 
 class VFXProcessor:
-    """Thin wrapper around the NVIDIA VFX Python SDK."""
+    """Wraps NVIDIA VFX SDK for GPU-accelerated video processing.
 
-    def __init__(self, scale: int = 2, quality: int = 2, batch_size: int = 4):
-        self.scale = scale
-        self.quality = quality
-        self.batch_size = batch_size
+    Supports Super Resolution (upscale), Denoising, and Deblurring modes
+    via nvvfx.VideoSuperRes.  Multiple modes are chained: SR runs first
+    (changing output dimensions), then denoise/deblur on the upscaled result.
+    """
+
+    def __init__(self, config: TaskConfig, src_w: int, src_h: int):
+        self._effects: list = []
+        self._out_w: int = 0
+        self._out_h: int = 0
+        self._build_effects(config, src_w, src_h)
+
+    @property
+    def output_width(self) -> int:
+        return self._out_w
+
+    @property
+    def output_height(self) -> int:
+        return self._out_h
+
+    @staticmethod
+    def _to_gpu(frame: "np.ndarray") -> "Any":
+        """Convert numpy uint8 (H, W, 3) to GPU float32 (3, H, W) in [0, 1]."""
+        if HAS_CUPY:
+            gpu = _cp.asarray(frame, dtype=_cp.float32) / 255.0
+            return gpu.transpose(2, 0, 1).copy()  # .copy() ensures contiguous memory
+        elif HAS_TORCH:
+            gpu = _torch.from_numpy(frame).float().cuda() / 255.0
+            return gpu.permute(2, 0, 1).contiguous()
+        raise RuntimeError("No GPU array library available (install cupy or torch)")
+
+    @staticmethod
+    def _to_numpy(gpu: "Any") -> "np.ndarray":
+        """Convert GPU float32 (3, H, W) in [0, 1] back to numpy uint8 (H, W, 3)."""
+        if HAS_CUPY:
+            gpu = gpu.transpose(1, 2, 0) * 255.0
+            gpu = _cp.clip(gpu, 0, 255)
+            return _cp.asnumpy(gpu.astype(_cp.uint8))
+        elif HAS_TORCH:
+            gpu = gpu.permute(1, 2, 0) * 255.0
+            gpu = gpu.clamp(0, 255).to(_torch.uint8)
+            return gpu.cpu().numpy()
+        raise RuntimeError("No GPU array library available (install cupy or torch)")
+
+    @staticmethod
+    def _from_dlpack(dlpack_capsule: "Any") -> "Any":
+        """Convert DLPack capsule from NVVFX output to a GPU array."""
+        if HAS_CUPY:
+            return _cp.from_dlpack(dlpack_capsule).copy()
+        elif HAS_TORCH:
+            return _torch.utils.dlpack.from_dlpack(dlpack_capsule).clone()
+        raise RuntimeError("No GPU array library available (install cupy or torch)")
+
+    def _build_effects(self, config: TaskConfig, src_w: int, src_h: int) -> None:
+        """Create and load NVVFX VideoSuperRes effects based on processing modes."""
+        if not HAS_NVVFX or not _vfx_available:
+            return
+
+        has_sr = ProcessMode.SUPER_RESOLUTION in config.modes
+        has_denoise = ProcessMode.DENOISE in config.modes
+        has_deblur = ProcessMode.DEBLUR in config.modes
+        has_hb = ProcessMode.HIGH_BITRATE in config.modes
+
+        q = config.quality
+        QL = _vfx.VideoSuperRes.QualityLevel
+        scale = config.scale_factor if has_sr else 1
+
+        # Super Resolution (always first – changes dimensions)
+        if has_sr:
+            sr_map: dict[QualityLevel, "Any"] = {
+                QualityLevel.LOW: QL.LOW,
+                QualityLevel.MEDIUM: QL.MEDIUM,
+                QualityLevel.HIGH: QL.HIGH,
+                QualityLevel.ULTRA: QL.ULTRA,
+            }
+            effect = _vfx.VideoSuperRes(quality=sr_map.get(q, QL.HIGH), device=0)
+            effect.output_width = src_w * scale
+            effect.output_height = src_h * scale
+            effect.load()
+            self._out_w = effect.output_width or (src_w * scale)
+            self._out_h = effect.output_height or (src_h * scale)
+            self._effects.append(effect)
+
+        # Denoise (applied after SR if SR is also selected)
+        if has_denoise:
+            dn_map: dict[QualityLevel, "Any"] = {
+                QualityLevel.LOW: QL.DENOISE_LOW,
+                QualityLevel.MEDIUM: QL.DENOISE_MEDIUM,
+                QualityLevel.HIGH: QL.DENOISE_HIGH,
+                QualityLevel.ULTRA: QL.DENOISE_ULTRA,
+            }
+            cur_w = self._out_w or src_w
+            cur_h = self._out_h or src_h
+            effect = _vfx.VideoSuperRes(quality=dn_map.get(q, QL.DENOISE_HIGH), device=0)
+            effect.output_width = cur_w
+            effect.output_height = cur_h
+            effect.load()
+            if not has_sr:
+                self._out_w = effect.output_width or cur_w
+                self._out_h = effect.output_height or cur_h
+            self._effects.append(effect)
+
+        # Deblur (applied after SR / denoise)
+        if has_deblur:
+            db_map: dict[QualityLevel, "Any"] = {
+                QualityLevel.LOW: QL.DEBLUR_LOW,
+                QualityLevel.MEDIUM: QL.DEBLUR_MEDIUM,
+                QualityLevel.HIGH: QL.DEBLUR_HIGH,
+                QualityLevel.ULTRA: QL.DEBLUR_ULTRA,
+            }
+            cur_w = self._out_w or src_w
+            cur_h = self._out_h or src_h
+            effect = _vfx.VideoSuperRes(quality=db_map.get(q, QL.DEBLUR_HIGH), device=0)
+            effect.output_width = cur_w
+            effect.output_height = cur_h
+            effect.load()
+            if not has_sr and not has_denoise:
+                self._out_w = effect.output_width or cur_w
+                self._out_h = effect.output_height or cur_h
+            self._effects.append(effect)
+
+        # High Bitrate (applied after other effects)
+        if has_hb:
+            hb_map: dict[QualityLevel, "Any"] = {
+                QualityLevel.LOW: QL.HIGHBITRATE_LOW,
+                QualityLevel.MEDIUM: QL.HIGHBITRATE_MEDIUM,
+                QualityLevel.HIGH: QL.HIGHBITRATE_HIGH,
+                QualityLevel.ULTRA: QL.HIGHBITRATE_ULTRA,
+            }
+            cur_w = self._out_w or src_w
+            cur_h = self._out_h or src_h
+            effect = _vfx.VideoSuperRes(quality=hb_map.get(q, QL.HIGHBITRATE_HIGH), device=0)
+            effect.output_width = cur_w
+            effect.output_height = cur_h
+            effect.load()
+            if not has_sr and not has_denoise and not has_deblur:
+                self._out_w = effect.output_width or cur_w
+                self._out_h = effect.output_height or cur_h
+            self._effects.append(effect)
+
+        logger.info(
+            "VFXProcessor created: %d effect(s), output %dx%d",
+            len(self._effects), self._out_w, self._out_h,
+        )
 
     def process_frame(self, frame: "np.ndarray") -> "np.ndarray":
-        """Process a single frame (used when batch_size == 1)."""
-        if HAS_NVVFX and _vfx_available:
-            return frame
-        return frame
+        """Process a single frame through all NVVFX effects."""
+        gpu = self._to_gpu(frame)
+        for effect in self._effects:
+            output = effect.run(gpu)
+            gpu = self._from_dlpack(output.image)
+        return self._to_numpy(gpu)
 
     def process_batch(self, frames: list["np.ndarray"]) -> list["np.ndarray"]:
-        """Submit a batch of frames to the GPU for higher throughput."""
-        if HAS_NVVFX and _vfx_available and len(frames) > 1:
-            return frames
+        """Process a batch of frames (processes individually; batch_size=1 recommended)."""
         return [self.process_frame(f) for f in frames]
 
+    def close(self) -> None:
+        """Release GPU resources held by NVVFX effects."""
+        for effect in self._effects:
+            try:
+                effect.close()
+            except Exception:
+                pass
+        self._effects.clear()
 
-def create_vfx_processor(config: TaskConfig) -> VFXProcessor:
-    quality_int = QUALITY_SCALE_MAP.get(config.quality, 2)
-    return VFXProcessor(
-        scale=config.scale_factor,
-        quality=quality_int,
-        batch_size=config.batch_size,
-    )
+
+def create_vfx_processor(config: TaskConfig, src_w: int = 0, src_h: int = 0) -> "Optional[VFXProcessor]":
+    """Create a VFXProcessor or return None if NVVFX is unavailable."""
+    if not _vfx_available:
+        return None
+    try:
+        return VFXProcessor(config, src_w, src_h)
+    except Exception as exc:
+        logger.warning("Failed to create VFX processor: %s", exc)
+        return None
 
 
 # --------------- Frame helpers ---------------
@@ -395,6 +565,7 @@ def _frame_size_bytes(w: int, h: int) -> int:
 async def _stream_process_nvvfx(
     task: Task,
     config: TaskConfig,
+    processor: "VFXProcessor",
     input_path: str,
     output_path: str,
     src_w: int, src_h: int,
@@ -408,14 +579,22 @@ async def _stream_process_nvvfx(
 
     No intermediate frames touch the disk – everything flows through
     in-memory pipes.  Works for videos of any length.
+
+    *processor* must be a valid, already-created VFXProcessor.
     """
     loop = asyncio.get_running_loop()
-    batch_size = config.batch_size
     in_frame_bytes = _frame_size_bytes(src_w, src_h)
-    out_frame_bytes = _frame_size_bytes(out_w, out_h)
 
-    processor = create_vfx_processor(config)
-    encoder_opts = _build_encoder_opts(config, fps, out_w, out_h)
+    # NVVFX effect determines actual output dimensions
+    act_w = processor.output_width or out_w
+    act_h = processor.output_height or out_h
+    logger.info(
+        "NVVFX output dimensions: %dx%d (requested %dx%d)",
+        act_w, act_h, out_w, out_h,
+    )
+    out_frame_bytes = _frame_size_bytes(act_w, act_h)
+
+    encoder_opts = _build_encoder_opts(config, fps, act_w, act_h)
 
     extra_kwargs: dict = {}
     if os.name == "nt":
@@ -437,7 +616,7 @@ async def _stream_process_nvvfx(
         "ffmpeg", "-y",
         "-f", "rawvideo",
         "-pixel_format", "rgb24",
-        "-video_size", f"{out_w}x{out_h}",
+        "-video_size", f"{act_w}x{act_h}",
         "-framerate", str(fps),
         "-i", "-",
     ]
@@ -530,37 +709,11 @@ async def _stream_process_nvvfx(
                 # Convert to numpy, process
                 arr = np.frombuffer(raw, dtype=np.uint8).reshape((src_h, src_w, 3))
 
-                if batch_size <= 1:
-                    result = processor.process_frame(arr)
-                    out_raw = result.tobytes()
-                else:
-                    # Batch: collect batch_size frames, process together
-                    batch = [arr]
-                    batch_raws: list[bytes] = []
-                    for _ in range(batch_size - 1):
-                        _check_cancelled(cancel_event)
-                        raw2 = b""
-                        while len(raw2) < in_frame_bytes:
-                            chunk = dec_proc.stdout.read(in_frame_bytes - len(raw2))
-                            if not chunk:
-                                break
-                            raw2 += chunk
-                        if len(raw2) < in_frame_bytes:
-                            break
-                        batch.append(
-                            np.frombuffer(raw2, dtype=np.uint8).reshape((src_h, src_w, 3))
-                        )
-                        batch_raws.append(raw2)
+                # Process frame through NVVFX
+                result = processor.process_frame(arr)
+                out_raw = result.tobytes()
 
-                    results = processor.process_batch(batch)
-                    # Write all results to encoder stdin
-                    for r in results:
-                        enc_proc.stdin.write(r.tobytes())
-                        enc_proc.stdin.flush()
-                    frames_processed += len(results)
-                    continue
-
-                # Single-frame: write to encoder
+                # Write to encoder
                 enc_proc.stdin.write(out_raw)
                 enc_proc.stdin.flush()
                 frames_processed += 1
@@ -720,17 +873,26 @@ async def process_task(
     _check_cancelled(cancel_event)
 
     # --- 2. Process ---
-    use_nvvfx = HAS_NVVFX and _vfx_available and ProcessMode.HIGH_BITRATE not in config.modes
+    # NVVFX is usable when: SDK loaded + GPU lib available + GPU-accelerable modes selected
+    gpu_modes = {ProcessMode.SUPER_RESOLUTION, ProcessMode.DENOISE, ProcessMode.DEBLUR, ProcessMode.HIGH_BITRATE}
+    has_gpu_mode = bool(set(config.modes) & gpu_modes)
+    want_nvvfx = HAS_NVVFX and _vfx_available and has_gpu_mode
 
-    if use_nvvfx:
+    # Try to create NVVFX processor; fall back gracefully if GPU not ready
+    processor = create_vfx_processor(config, src_w, src_h) if want_nvvfx else None
+
+    if processor is not None:
         logger.info("Task %s: using NVVFX streaming pipeline", task.id)
         await _stream_process_nvvfx(
-            task, config, input_path, output_path,
+            task, config, processor, input_path, output_path,
             src_w, src_h, out_w, out_h, fps,
             total_frames, cancel_event, progress_callback,
         )
     else:
-        logger.info("Task %s: using fallback ffmpeg pipeline", task.id)
+        if want_nvvfx:
+            logger.warning("Task %s: NVVFX init failed, falling back to ffmpeg pipeline", task.id)
+        else:
+            logger.info("Task %s: using fallback ffmpeg pipeline", task.id)
         await _stream_process_fallback(
             task, config, input_path, output_path,
             src_w, src_h, out_w, out_h, fps,

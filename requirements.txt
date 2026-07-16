@@ -4,3 +4,5 @@ python-multipart==0.0.9
 aiofiles==24.1.0
 websockets==12.0
 nvidia-vfx
+numpy
+cupy-cuda12x  # GPU array library for NVVFX (or install torch instead)

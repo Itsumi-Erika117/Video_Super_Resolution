@@ -10,16 +10,17 @@
 
 ## 功能特性
 
-- 🔍 **超分辨率** — 1×–4× AI 放大，支持将 1080p 提升至 4K
-- 🔇 **降噪** — 同分辨率去噪（hqdn3d），适合低光照 / 老胶片素材
-- 🔎 **去模糊** — 同分辨率锐化（unsharp），修复轻微失焦
-- 📡 **高码率重编码** — 保留高质量源素材细节
+- 🔍 **超分辨率** — 1×–4× AI 放大（NVVFX），支持将 1080p 提升至 4K
+- 🔇 **降噪** — AI 降噪（NVVFX）或同分辨率去噪（hqdn3d），适合低光照 / 老胶片素材
+- 🔎 **去模糊** — AI 去模糊（NVVFX）或同分辨率锐化（unsharp），修复轻微失焦
+- 📡 **高码率重编码** — AI 增强（NVVFX）或保留高质量源素材细节
 - ✅ **多模式自由组合** — 勾选超分 + 降噪 + 去模糊，一次性处理
-- ⚡ **GPU 硬件加速** — NVDEC 解码 + NVENC 编码，大幅缩短处理时间
+- ⚡ **GPU 硬件加速** — NVDEC 解码 + NVVFX AI 处理 + NVENC 编码，全链路 GPU
 - 📋 **任务队列** — 支持批量上传，FIFO 队列逐个处理
 - 🔄 **实时进度** — WebSocket 推送，处理进度条实时更新
 - 🚫 **随时取消** — 正在运行的任务可即时中止
 - 📁 **长视频友好** — 流式管道处理，无中间文件落盘，支持数小时视频
+- 🔄 **智能回退** — NVVFX 不可用时自动回退到 FFmpeg 软件滤镜方案
 
 ## 技术栈
 
@@ -28,7 +29,8 @@
 | **后端框架** | FastAPI + Uvicorn |
 | **实时通信** | WebSocket |
 | **视频处理** | FFmpeg (NVDEC / NVENC) |
-| **AI 加速 SDK** | NVIDIA VFX SDK（可选） |
+| **AI 加速 SDK** | NVIDIA VFX SDK + CuPy（GPU 数组库） |
+| **AI 推理** | TensorRT 10 + cuDNN 9 + CUDA 12 运行时 |
 | **前端框架** | React 18 + TypeScript |
 | **样式** | Tailwind CSS |
 | **构建工具** | Vite |
@@ -80,11 +82,16 @@ vediosuperresolution/
 
 | 组件 | 最低版本 | 说明 |
 |------|----------|------|
-| **NVIDIA 显卡** | GTX 10 系列+ | 支持 NVDEC / NVENC |
+| **NVIDIA 显卡** | RTX 20 系列+ | NVVFX AI 超分需要 Tensor Core |
 | **NVIDIA 驱动** | 610.00+ | NVENC 编码器可用性 |
-| **NVIDIA VFX SDK** | — | 可选，启用 AI 超分增强 |
+| **CUDA 运行时** | 12.x | NVIDIA VFX SDK 编译依赖 |
+| **cuDNN** | 9.x | TensorRT 推理依赖 |
+| **CuPy** | 14.x (cuda12x) | GPU 数组库，DLPack 桥接 |
 
-> **注意**：未安装 NVIDIA VFX SDK 时，超分辨率将使用 FFmpeg `lanczos` 缩放算法作为回退方案，降噪和去模糊使用 FFmpeg 内置滤镜。
+> **注意**：
+> - NVVFX SDK 可用时，超分、降噪、去模糊、高码率均使用 AI 模型处理
+> - NVVFX 不可用时，自动回退到 FFmpeg 内置滤镜（lanczos 缩放 / hqdn3d 降噪 / unsharp 锐化）
+> - 首次运行 NVVFX 时 SDK 需要在线下载 AI 模型到本地缓存（~1-2 GB）
 
 ## 快速开始
 
@@ -185,13 +192,17 @@ npm run dev
                                           │
                     ┌─────────────────────┼─────────────────────┐
                     ▼                                           ▼
-            NVVFX 路径 (GPU)                            Fallback 路径 (CPU)
-    ffmpeg decode → pipe → NVVFX →                    ffmpeg 单命令：
-    pipe → ffmpeg encode                               -hwaccel cuda + 滤镜链
+            NVVFX 路径 (GPU)                            Fallback 路径
+    ffmpeg NVDEC → raw RGB24 →                   ffmpeg 单命令：
+    CuPy GPU 张量 → NVVFX AI →                   -hwaccel cuda + 滤镜链
+    raw RGB24 → ffmpeg NVENC                     (lanczos/hqdn3d/unsharp)
 ```
 
+- **NVVFX 管线**：解码 → GPU 张量转换(CuPy) → NVIDIA VFX SDK AI 处理 → 编码，全链路 GPU
+- **Fallback 管线**：FFmpeg 内置滤镜链，NVENC 硬件编码
 - **无中间文件**：帧数据通过内存管道传输，支持任意长度视频
 - **进度节流**：每 1% 或每秒更新一次进度，避免大视频时事件循环拥塞
+- **智能回退**：NVVFX 初始化失败时自动切换至 Fallback，不中断任务
 
 ## API 概览
 
@@ -220,4 +231,35 @@ npm run dev
 | `video_encoder` | string | 编码器：`h264_nvenc`/`hevc_nvenc`/`libx264`/`libx265`/`libvpx-vp9` |
 | `batch_size` | int | GPU 批处理大小（1–16） |
 
+
+## 更新日志
+
+### v1.1 (2026-07-16)
+
+**NVVFX GPU 加速管线正式可用**
+
+经过全面调试，修复了 NVIDIA VFX SDK 集成中的多个关键问题，NVVFX AI 处理管线现已稳定运行。
+
+**修复内容：**
+
+-  **修复导入名错误**：`import nvidia.vfx` → `import nvvfx`（正确的 Python 模块名）
+-  **重写 VFXProcessor**：从空壳实现改为真正调用 `nvvfx.VideoSuperRes` SDK，支持超分/降噪/去模糊/高码率四种模式及链式组合处理
+-  **修复 output_size 缺失**：`effect.load()` 前必须设置 `output_width`/`output_height`，否则 SDK 报 -1999 错误
+-  **修复张量连续性**：CuPy `transpose()` 后添加 `.copy()` 确保连续内存，满足 SDK 的 DLPack 接口要求
+-  **补全 GPU 依赖链**：新增 `cupy-cuda12x`、`nvidia-cuda-runtime-cu12`、`nvidia-cublas-cu12` 依赖
+-  **添加 cuDNN**：手动放置 `cudnn64_9.dll` 至 nvvfx libs 目录，满足 TensorRT 10 运行时需求
+-  **智能回退机制**：NVVFX 初始化失败时自动切换至 FFmpeg 软件滤镜，不中断任务
+
+**已知限制：**
+
+- NVVFX SDK v0.1.0.1 首次 `load()` 需在线下载 AI 模型（~1-2 GB），国内网络可能需要代理
+- SDK 要求 CUDA 12.x 运行时，与 CUDA 13.x 共存时需额外安装 `nvidia-cuda-runtime-cu12`
+
+### v1.0 (初始版本)
+
+- 基础视频超分辨率/降噪/去模糊功能
+- NVVFX 占位符（未实际调用 SDK）
+- FFmpeg 软件滤镜回退方案
+- WebSocket 实时进度推送
+- 任务队列与取消支持
 
