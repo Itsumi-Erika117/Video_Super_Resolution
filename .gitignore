@@ -19,6 +19,9 @@ node_modules/
 uploads/
 output/
 
+# External tools (large binaries, downloaded separately)
+tools/
+
 # Logs
 *.log
 

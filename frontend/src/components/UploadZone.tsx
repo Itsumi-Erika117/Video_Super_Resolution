@@ -35,6 +35,7 @@ export default function UploadZone({ settings, setTasks }: Props) {
       formData.append('output_format', settings.outputFormat);
       formData.append('video_encoder', settings.videoEncoder);
       formData.append('batch_size', String(settings.batchSize));
+      formData.append('frame_multiplier', String(settings.frameMultiplier));
 
       try {
         const res = await fetch('/api/upload', { method: 'POST', body: formData });

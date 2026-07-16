@@ -10,6 +10,7 @@ const MODES: { value: ProcessMode; label: string; desc: string }[] = [
   { value: 'denoise', label: '🔇 降噪', desc: '同分辨率去噪，适合低光/老胶片' },
   { value: 'deblur', label: '🔎 去模糊', desc: '同分辨率去模糊，修复轻微失焦' },
   { value: 'high_bitrate', label: '📡 高码率', desc: '保留高质量源细节（不与超分/降噪/去模糊组合）' },
+  { value: 'frame_interpolation', label: '🎞️ 插帧', desc: 'AI补帧提升流畅度(RIFE)，2x-4x' },
 ];
 
 const QUALITIES: { value: QualityLevel; label: string }[] = [
@@ -39,6 +40,7 @@ export default function SettingsPanel({ settings, onSettingsChange }: Props) {
     onSettingsChange({ ...settings, ...patch });
 
   const isSuperResolution = settings.modes.includes('super_resolution');
+  const isInterpolation = settings.modes.includes('frame_interpolation');
 
   const toggleMode = (m: ProcessMode) => {
     if (settings.modes.includes(m)) {
@@ -97,6 +99,30 @@ export default function SettingsPanel({ settings, onSettingsChange }: Props) {
                 className={`w-14 h-14 rounded-xl border text-lg font-bold transition-all ${
                   settings.scaleFactor === x
                     ? 'border-cyan-500/50 bg-cyan-500/10 text-cyan-400 ring-1 ring-cyan-500/30'
+                    : 'border-gray-800 bg-gray-900/50 text-gray-400 hover:border-gray-600'
+                }`}
+              >
+                {x}x
+              </button>
+            ))}
+          </div>
+        </section>
+      )}
+
+      {/* Frame multiplier (only for frame interpolation) */}
+      {isInterpolation && (
+        <section>
+          <h3 className="text-sm font-medium text-gray-400 mb-3">
+            插帧倍数（帧率 x{settings.frameMultiplier}，如 30fps → {30 * settings.frameMultiplier}fps）
+          </h3>
+          <div className="flex gap-2">
+            {[2, 3, 4].map((x) => (
+              <button
+                key={x}
+                onClick={() => update({ frameMultiplier: x })}
+                className={`w-14 h-14 rounded-xl border text-lg font-bold transition-all ${
+                  settings.frameMultiplier === x
+                    ? 'border-purple-500/50 bg-purple-500/10 text-purple-400 ring-1 ring-purple-500/30'
                     : 'border-gray-800 bg-gray-900/50 text-gray-400 hover:border-gray-600'
                 }`}
               >

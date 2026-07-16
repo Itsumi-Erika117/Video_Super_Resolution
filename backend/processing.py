@@ -76,6 +76,45 @@ logger.info(
     _vfx_available, HAS_NVVFX, HAS_CUPY, HAS_TORCH,
 )
 
+# --------------- RIFE (rife-ncnn-vulkan CLI) ---------------
+
+# Search for rife-ncnn-vulkan.exe in standard locations
+_RIFE_EXE: Optional[str] = None
+_RIFE_MODEL_DIR: Optional[str] = None
+
+_tools_dir = Path(__file__).resolve().parent.parent / "tools" / "rife-ncnn-vulkan"
+_candidate_exe = _tools_dir / "rife-ncnn-vulkan.exe"
+if _candidate_exe.is_file():
+    _RIFE_EXE = str(_candidate_exe)
+    # Model dirs are siblings of the exe (rife-v4, rife-v4.6, etc.)
+    _RIFE_MODEL_DIR = str(_tools_dir)
+    logger.info("RIFE CLI found: %s", _RIFE_EXE)
+else:
+    import shutil as _shutil
+    _path_exe = _shutil.which("rife-ncnn-vulkan")
+    if _path_exe:
+        _RIFE_EXE = _path_exe
+        logger.info("RIFE CLI found in PATH: %s", _RIFE_EXE)
+    else:
+        logger.warning(
+            "RIFE CLI (rife-ncnn-vulkan.exe) not found. "
+            "Download: https://github.com/nihui/rife-ncnn-vulkan/releases\n"
+            "Extract to: %s", _tools_dir
+        )
+
+HAS_RIFE = _RIFE_EXE is not None
+
+RIFE_SUPPORTED_MULTIPLIERS = (2, 3, 4)
+
+
+def _validate_rife_multiplier(multiplier: int) -> None:
+    if multiplier not in RIFE_SUPPORTED_MULTIPLIERS:
+        raise ValueError(
+            f"Unsupported frame multiplier: {multiplier}. "
+            f"Supported: {RIFE_SUPPORTED_MULTIPLIERS}"
+        )
+
+
 # --------------- Constants ---------------
 
 DEFAULT_TIMEOUT_SECONDS = 3600 * 4  # 4 hours max per task
@@ -404,6 +443,7 @@ def _spawn_cancel_watcher(
 def _build_encoder_opts(
     config: TaskConfig, fps: float, out_w: int, out_h: int,
     audio_input_index: int = 1,
+    output_fps: Optional[float] = None,
 ) -> list[str]:
     """Return the shared encoder-quality portion of the ffmpeg command.
 
@@ -421,6 +461,11 @@ def _build_encoder_opts(
     pix_fmt = "yuv420p"
 
     opts = ["-s", f"{out_w}x{out_h}"]
+
+    # Explicit output frame rate (needed when interpolation changes FPS)
+    if output_fps is not None:
+        opts += ["-r", str(output_fps)]
+
     if is_nvenc:
         opts += [
             "-c:v", encoder, "-cq", str(q_val),
@@ -443,18 +488,27 @@ def _build_encoder_opts(
 
 
 def _build_filter_desc(config: TaskConfig, out_w: int, out_h: int,
-                       src_w: int, src_h: int) -> str:
+                       src_w: int, src_h: int,
+                       fps: float = 30.0) -> str:
     """Return the ffmpeg video filter chain for the fallback path.
 
     Supports multiple modes via comma-separated filter chain (e.g.
     'scale,hqdn3d,unsharp' when user selects multiple processing options).
-    Filters are applied in the order: scale → denoise → deblur.
+    Filters are applied in the order: minterpolate → scale → denoise → deblur.
     """
     filters: list[str] = []
+    has_interp = ProcessMode.FRAME_INTERPOLATION in config.modes
     has_sr = ProcessMode.SUPER_RESOLUTION in config.modes and (out_w != src_w or out_h != src_h)
     has_denoise = ProcessMode.DENOISE in config.modes
     has_deblur = ProcessMode.DEBLUR in config.modes
     has_high_bitrate = ProcessMode.HIGH_BITRATE in config.modes
+
+    # Frame interpolation via ffmpeg minterpolate (runs first, changes FPS)
+    if has_interp:
+        target_fps = fps * config.frame_multiplier
+        filters.append(
+            f"minterpolate=fps={target_fps}:mi_mode=mci:mc_mode=aobmc:me_mode=bidir:vsbmc=1"
+        )
 
     if has_sr:
         filters.append(f"scale={out_w}:{out_h}:flags=lanczos")
@@ -464,8 +518,7 @@ def _build_filter_desc(config: TaskConfig, out_w: int, out_h: int,
         filters.append("unsharp=5:5:1.0:5:5:0.0")
 
     if not filters:
-        # HIGH_BITRATE only or no filters selected
-        return "null" if has_high_bitrate else "null"
+        return "null"
     return ",".join(filters)
 
 
@@ -795,9 +848,13 @@ async def _stream_process_fallback(
     No intermediate files – everything happens in a single ffmpeg invocation.
     Works for videos of any length.
     """
-    filter_desc = _build_filter_desc(config, out_w, out_h, src_w, src_h)
+    filter_desc = _build_filter_desc(config, out_w, out_h, src_w, src_h, fps)
     # Fallback has a single input (0), so audio is at 0:a:0
-    encoder_opts = _build_encoder_opts(config, fps, out_w, out_h, audio_input_index=0)
+    has_interp = ProcessMode.FRAME_INTERPOLATION in config.modes
+    out_fps = fps * config.frame_multiplier if has_interp else None
+    encoder_opts = _build_encoder_opts(config, fps, out_w, out_h,
+                                       audio_input_index=0,
+                                       output_fps=out_fps)
 
     cmd = [
         "ffmpeg", "-y",
@@ -829,6 +886,731 @@ async def _stream_process_fallback(
     )
 
     task.current_frame = total_frames
+
+
+# --------------- RIFE pipeline (two-phase: extract → CLI → NVVFX/encode) ---------------
+
+
+async def _run_rife_cli(
+    input_dir: str,
+    output_dir: str,
+    multiplier: int = 2,
+    cancel_event: Optional[threading.Event] = None,
+    timeout: float = DEFAULT_TIMEOUT_SECONDS,
+) -> None:
+    """Run rife-ncnn-vulkan CLI in directory mode.
+
+    Generates (multiplier-1) interpolated frames between each pair of input frames.
+    Output files are numbered 1..(multiplier-1)*(N-1) in the output directory.
+    """
+    if not _RIFE_EXE:
+        raise RuntimeError("RIFE CLI not found")
+
+    _validate_rife_multiplier(multiplier)
+
+    # RIFE's -n is "target total interpolated frames", default N*2 (≈3x!).
+    # We want (multiplier-1) intermediates per pair, so target is:
+    #   (multiplier-1) * (input_frame_count - 1)
+    input_files = sorted(
+        f for f in os.listdir(input_dir)
+        if f.lower().endswith((".png", ".jpg", ".webp"))
+    )
+    input_count = len(input_files)
+    if input_count < 2:
+        raise RuntimeError(f"Input directory has only {input_count} frames (need >=2)")
+
+    target_frames = (multiplier - 1) * (input_count - 1)
+    n_args = ["-n", str(max(target_frames, 1))]
+    logger.info(
+        "RIFE -n %d (multiplier=%dx, input=%d frames, target=%d interp)",
+        max(target_frames, 1), multiplier, input_count, target_frames,
+    )
+
+    model_arg: list[str] = []
+    if _RIFE_MODEL_DIR and os.path.isdir(_RIFE_MODEL_DIR):
+        # Use rife-v4.6 model if available, otherwise default to auto-detect
+        candidate = os.path.join(_RIFE_MODEL_DIR, "rife-v4.6")
+        if os.path.isdir(candidate):
+            model_arg = ["-m", candidate]
+
+    cmd = [
+        _RIFE_EXE,
+        "-i", input_dir,
+        "-o", output_dir,
+        "-f", "%08d.png",
+        "-j", "2:4:4",
+    ] + n_args + model_arg
+
+    extra_kwargs: dict = {}
+    if os.name == "nt":
+        extra_kwargs["creationflags"] = 0x08000000
+
+    loop = asyncio.get_running_loop()
+
+    def _run() -> None:
+        try:
+            proc = subprocess.Popen(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                **extra_kwargs,
+            )
+        except FileNotFoundError:
+            raise RuntimeError(f"未找到 RIFE CLI: {_RIFE_EXE}")
+
+        if cancel_event:
+            _spawn_cancel_watcher(cancel_event, proc)
+
+        # Drain stdout
+        _drain_pipe(proc, "stdout")
+
+        stderr_lines: list[str] = []
+        try:
+            for line_bytes in iter(proc.stderr.readline, b""):
+                _check_cancelled(cancel_event)
+                line = line_bytes.decode(errors="replace").rstrip()
+                stderr_lines.append(line)
+                logger.debug("RIFE: %s", line)
+        except (TaskCancelledError, Exception):
+            try:
+                proc.kill()
+            except Exception:
+                pass
+            proc.wait()
+            raise
+
+        proc.wait()
+        if proc.returncode != 0:
+            err_msg = "\n".join(stderr_lines[-30:])
+            raise RuntimeError(f"RIFE 插帧失败 (code {proc.returncode}): {err_msg}")
+
+    await asyncio.wait_for(
+        loop.run_in_executor(None, _run),
+        timeout=timeout,
+    )
+
+
+async def _extract_frames_to_dir(
+    input_path: str,
+    output_dir: str,
+    total_frames: int,
+    fps: float = 30.0,
+    cancel_event: Optional[threading.Event] = None,
+    progress_callback: Optional[Callable[[float, int, int], None]] = None,
+) -> None:
+    # Frame extraction: use software decoding + -r to force strict
+    # sequential display-order output, preventing frame reordering.
+    out_pattern = os.path.join(output_dir, "frame_%08d.png")
+    cmd = [
+        "ffmpeg", "-y",
+        "-i", input_path,
+        "-r", str(fps),
+        "-q:v", "1",
+        out_pattern,
+    ]
+
+    _frame_re = re.compile(r"frame=\s*(\d+)")
+    loop = asyncio.get_running_loop()
+
+    extra_kwargs: dict = {}
+    if os.name == "nt":
+        extra_kwargs["creationflags"] = 0x08000000
+
+    def _run() -> None:
+        try:
+            proc = subprocess.Popen(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                **extra_kwargs,
+            )
+        except FileNotFoundError:
+            raise RuntimeError("未找到 ffmpeg")
+
+        if cancel_event:
+            _spawn_cancel_watcher(cancel_event, proc)
+
+        _drain_pipe(proc, "stdout")
+
+        _last_pct = -1.0
+        _last_time = 0.0
+
+        try:
+            for line_bytes in iter(proc.stderr.readline, b""):
+                _check_cancelled(cancel_event)
+                line = line_bytes.decode(errors="replace").rstrip()
+                if progress_callback and total_frames > 0:
+                    m = _frame_re.search(line)
+                    if m:
+                        cur = int(m.group(1))
+                        pct = min((cur / total_frames) * 10.0, 10.0)  # 0-10%
+                        now = time.monotonic()
+                        if pct - _last_pct >= 0.5 or now - _last_time >= 1.0:
+                            _last_pct = pct
+                            _last_time = now
+                            asyncio.run_coroutine_threadsafe(
+                                progress_callback(pct, cur, total_frames), loop
+                            )
+        except (TaskCancelledError, Exception):
+            try:
+                proc.kill()
+            except Exception:
+                pass
+            proc.wait()
+            raise
+
+        proc.wait()
+        if proc.returncode != 0:
+            raise RuntimeError(f"ffmpeg 帧提取失败 (code {proc.returncode})")
+
+    await asyncio.wait_for(
+        loop.run_in_executor(None, _run),
+        timeout=DEFAULT_TIMEOUT_SECONDS,
+    )
+
+
+async def _process_rife_pipeline(
+    task: Task,
+    config: TaskConfig,
+    processor: "Optional[VFXProcessor]",
+    input_path: str,
+    output_path: str,
+    src_w: int, src_h: int,
+    out_w: int, out_h: int,
+    fps: float,
+    total_frames: int,
+    cancel_event: threading.Event,
+    progress_callback: Callable[[float, int, int], None],
+) -> None:
+    """Two-phase RIFE pipeline:
+
+    Phase 1: ffmpeg extract original frames to temp dir (0-10%)
+    Phase 2: rife-ncnn-vulkan CLI interpolate (10-70%)
+    Phase 3: Read & interleave original + interpolated frames, process with
+             NVVFX (or pass-through), encode (70-100%)
+    """
+    import tempfile as _tempfile
+    import shutil as _shutil_mod
+
+    loop = asyncio.get_running_loop()
+    multiplier = config.frame_multiplier
+    _validate_rife_multiplier(multiplier)
+
+    has_nvvfx = processor is not None
+    out_fps = fps * multiplier
+
+    if has_nvvfx:
+        act_w = processor.output_width or out_w
+        act_h = processor.output_height or out_h
+    else:
+        act_w, act_h = src_w, src_h
+
+    # Total output frames after interpolation
+    out_total = total_frames * multiplier - (multiplier - 1)
+    interp_per_pair = multiplier - 1
+    out_frame_bytes = _frame_size_bytes(act_w, act_h)
+    in_frame_bytes = _frame_size_bytes(src_w, src_h)
+
+    logger.info(
+        "RIFE pipeline: %dx%d %dx → %d output frames, NVVFX=%s",
+        src_w, src_h, multiplier, out_total, has_nvvfx,
+    )
+
+    # Create temp directories
+    base_tmp = _tempfile.mkdtemp(prefix="rife_")
+    orig_dir = os.path.join(base_tmp, "orig")
+    interp_dir = os.path.join(base_tmp, "interp")
+    os.makedirs(orig_dir, exist_ok=True)
+    os.makedirs(interp_dir, exist_ok=True)
+
+    extra_kwargs: dict = {}
+    if os.name == "nt":
+        extra_kwargs["creationflags"] = 0x08000000
+
+    encoder_opts = _build_encoder_opts(config, out_fps, act_w, act_h)
+    _frame_re = re.compile(r"frame=\s*(\d+)")
+
+    async def _cleanup() -> None:
+        try:
+            _shutil_mod.rmtree(base_tmp, ignore_errors=True)
+        except Exception:
+            pass
+
+    try:
+        # === Phase 1: Extract original frames (0-10%) ===
+        await progress_callback(0.0, 0, out_total)
+        await _extract_frames_to_dir(
+            input_path, orig_dir, total_frames, fps=fps,
+            cancel_event=cancel_event,
+            progress_callback=progress_callback,
+        )
+        _check_cancelled(cancel_event)
+
+        # List original frames (sorted)
+        orig_files = sorted(
+            f for f in os.listdir(orig_dir) if f.endswith(".png")
+        )
+        if not orig_files:
+            raise RuntimeError("帧提取失败：未生成任何 PNG 文件")
+        logger.info("Extracted %d original frames to %s", len(orig_files), orig_dir)
+
+        # === Phase 2: RIFE CLI interpolate (10-70%) ===
+        await progress_callback(10.0, 0, out_total)
+        await _run_rife_cli(
+            orig_dir, interp_dir, multiplier,
+            cancel_event=cancel_event,
+        )
+        _check_cancelled(cancel_event)
+        await progress_callback(70.0, 0, out_total)
+
+        # List interpolated frames (sorted)
+        interp_files = sorted(
+            f for f in os.listdir(interp_dir) if f.endswith(".png")
+        )
+        logger.info("RIFE generated %d interpolated frames in %s", len(interp_files), interp_dir)
+
+        expected_interp = interp_per_pair * (len(orig_files) - 1)
+        if len(interp_files) < expected_interp:
+            logger.warning(
+                "Expected %d interpolated frames, got %d",
+                expected_interp, len(interp_files),
+            )
+
+        # === Phase 3: Encode (70-100%) ===
+        # Merge frames with hardlinks (instant, no data copy), then read
+        # with PIL directly instead of another ffmpeg decode process.
+        # This eliminates the disk I/O bottleneck from re-decoding
+        # thousands of PNGs through a separate ffmpeg instance.
+
+        try:
+            from PIL import Image as _PILImage
+            _HAS_PIL = True
+        except ImportError:
+            _HAS_PIL = False
+            logger.warning("Pillow not installed – falling back to ffmpeg for PNG decode")
+
+        merged_dir = os.path.join(base_tmp, "merged")
+        os.makedirs(merged_dir, exist_ok=True)
+
+        def _link_or_copy(src: str, dst: str) -> None:
+            """Create hardlink (instant) or fallback copy if cross-device."""
+            try:
+                os.link(src, dst)
+            except OSError:
+                _shutil_mod.copy2(src, dst)
+
+        # Interleave: orig0, interp(0,1)[0..k-1], orig1, interp(1,2)[0..k-1], ...
+        interp_idx = 0
+        frame_num = 1
+        for i, orig_fname in enumerate(orig_files):
+            _link_or_copy(
+                os.path.join(orig_dir, orig_fname),
+                os.path.join(merged_dir, f"{frame_num:08d}.png"),
+            )
+            frame_num += 1
+
+            if i < len(orig_files) - 1:
+                for k in range(interp_per_pair):
+                    if interp_idx < len(interp_files):
+                        _link_or_copy(
+                            os.path.join(interp_dir, interp_files[interp_idx]),
+                            os.path.join(merged_dir, f"{frame_num:08d}.png"),
+                        )
+                        frame_num += 1
+                        interp_idx += 1
+
+        total_merged = frame_num - 1
+        logger.info("Merged %d frames into %s (hardlinks)", total_merged, merged_dir)
+
+        if not _HAS_PIL:
+            # Fallback: ffmpeg image2 demuxer
+            decode2_cmd = [
+                "ffmpeg", "-y",
+                "-framerate", str(out_fps),
+                "-i", os.path.join(merged_dir, "%08d.png"),
+                "-f", "rawvideo",
+                "-pix_fmt", "rgb24",
+                "-",
+            ]
+
+        encode_cmd = [
+            "ffmpeg", "-y",
+            "-f", "rawvideo",
+            "-pixel_format", "rgb24",
+            "-video_size", f"{act_w}x{act_h}",
+            "-framerate", str(out_fps),
+            "-i", "-",
+        ]
+        if config.keep_audio:
+            encode_cmd += ["-i", input_path]
+        encode_cmd += encoder_opts
+        encode_cmd.append(output_path)
+
+        logger.info("Phase 3: streaming %d frames (PIL=%s)→NVVFX→encode", total_merged, _HAS_PIL)
+
+        def _run_encode() -> None:
+            """Phase 3 worker: read frames → NVVFX → encode."""
+            if _HAS_PIL:
+                # PIL path: read PNGs directly, no ffmpeg decode overhead
+                dec2_proc = None
+            else:
+                # ffmpeg fallback
+                try:
+                    dec2_proc = subprocess.Popen(
+                        decode2_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                        bufsize=1024 * 1024, **extra_kwargs,
+                    )
+                except FileNotFoundError:
+                    raise RuntimeError("未找到 ffmpeg")
+
+            try:
+                enc_proc = subprocess.Popen(
+                    encode_cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE, bufsize=1024 * 1024, **extra_kwargs,
+                )
+            except FileNotFoundError:
+                if dec2_proc:
+                    dec2_proc.kill()
+                    dec2_proc.wait()
+                raise RuntimeError("未找到 ffmpeg")
+
+            if dec2_proc:
+                _drain_pipe(dec2_proc, "stderr")
+            _drain_pipe(enc_proc, "stdout")
+            _spawn_cancel_watcher(cancel_event, enc_proc, *([dec2_proc] if dec2_proc else []))
+
+            enc_stderr_lines: list[str] = []
+
+            def _read_stderr():
+                _last_pct = 70.0
+                _last_time = 0.0
+                try:
+                    for line_bytes in iter(enc_proc.stderr.readline, b""):
+                        if cancel_event.is_set():
+                            break
+                        line = line_bytes.decode(errors="replace").rstrip()
+                        enc_stderr_lines.append(line)
+                        if out_total > 0:
+                            m = _frame_re.search(line)
+                            if m:
+                                cur = int(m.group(1))
+                                pct = 70.0 + min((cur / out_total) * 30.0, 29.0)
+                                now = time.monotonic()
+                                if pct - _last_pct >= 1.0 or now - _last_time >= 1.0:
+                                    _last_pct = pct
+                                    _last_time = now
+                                    asyncio.run_coroutine_threadsafe(
+                                        progress_callback(pct, cur, out_total), loop
+                                    )
+                except Exception:
+                    pass
+
+            stderr_thread = threading.Thread(target=_read_stderr, daemon=True)
+            stderr_thread.start()
+
+            try:
+                frames_written = 0
+
+                if _HAS_PIL:
+                    # Read merged frames directly with PIL (fast, sequential)
+                    for frame_num in range(1, total_merged + 1):
+                        _check_cancelled(cancel_event)
+
+                        if HAS_CUPY and frames_written > 0 and frames_written % 100 == 0:
+                            _cp.get_default_memory_pool().free_all_blocks()
+
+                        fpath = os.path.join(merged_dir, f"{frame_num:08d}.png")
+                        try:
+                            with _PILImage.open(fpath) as pil_img:
+                                arr = np.array(pil_img.convert("RGB"))
+                        except Exception as exc:
+                            raise RuntimeError(f"读取帧 {fpath} 失败: {exc}") from exc
+
+                        if has_nvvfx:
+                            result = processor.process_frame(arr)
+                            enc_proc.stdin.write(result.tobytes())
+                        else:
+                            enc_proc.stdin.write(arr.tobytes())
+                        enc_proc.stdin.flush()
+                        frames_written += 1
+                else:
+                    # ffmpeg pipe fallback
+                    while True:
+                        _check_cancelled(cancel_event)
+
+                        if HAS_CUPY and frames_written > 0 and frames_written % 100 == 0:
+                            _cp.get_default_memory_pool().free_all_blocks()
+
+                        raw = b""
+                        while len(raw) < in_frame_bytes:
+                            chunk = dec2_proc.stdout.read(in_frame_bytes - len(raw))
+                            if not chunk:
+                                break
+                            raw += chunk
+                        if len(raw) < in_frame_bytes:
+                            break
+
+                        arr = np.frombuffer(raw, dtype=np.uint8).reshape((src_h, src_w, 3))
+
+                        if has_nvvfx:
+                            result = processor.process_frame(arr)
+                            enc_proc.stdin.write(result.tobytes())
+                        else:
+                            enc_proc.stdin.write(arr.tobytes())
+                        enc_proc.stdin.flush()
+                        frames_written += 1
+
+                try:
+                    enc_proc.stdin.close()
+                except Exception:
+                    pass
+
+                _check_cancelled(cancel_event)
+                enc_proc.wait()
+                stderr_thread.join(timeout=5)
+
+                if enc_proc.returncode != 0:
+                    err_msg = "\n".join(enc_stderr_lines[-20:])
+                    raise RuntimeError(
+                        f"ffmpeg 编码失败 (code {enc_proc.returncode}): {err_msg}"
+                    )
+
+                task.current_frame = frames_written
+                task.total_frames = frames_written
+
+            except TaskCancelledError:
+                try:
+                    if dec2_proc:
+                        dec2_proc.kill()
+                except Exception:
+                    pass
+                try:
+                    enc_proc.kill()
+                except Exception:
+                    pass
+                stderr_thread.join(timeout=3)
+                raise
+            except Exception:
+                try:
+                    if dec2_proc:
+                        dec2_proc.kill()
+                except Exception:
+                    pass
+                try:
+                    enc_proc.kill()
+                except Exception:
+                    pass
+                stderr_thread.join(timeout=3)
+                raise
+
+        await asyncio.wait_for(
+            loop.run_in_executor(None, _run_encode),
+            timeout=DEFAULT_TIMEOUT_SECONDS,
+        )
+
+        task.progress = 100.0
+        task.current_frame = out_total
+        task.total_frames = out_total
+
+    finally:
+        await _cleanup()
+
+
+# --------------- Fallback: minterpolate + NVVFX pipeline ---------------
+
+
+async def _stream_process_fallback_interp_nvvfx(
+    task: Task,
+    config: TaskConfig,
+    processor: "VFXProcessor",
+    input_path: str,
+    output_path: str,
+    src_w: int, src_h: int,
+    out_w: int, out_h: int,
+    fps: float,
+    total_frames: int,
+    cancel_event: threading.Event,
+    progress_callback: Callable[[float, int, int], None],
+) -> None:
+    """Streaming fallback: ffmpeg minterpolate → pipe → NVVFX → pipe → ffmpeg encode.
+
+    Used when RIFE is unavailable but NVVFX is loaded.
+    First ffmpeg instance decodes and interpolates to raw RGB24;
+    Second ffmpeg instance encodes the NVVFX-processed frames.
+    """
+    loop = asyncio.get_running_loop()
+    multiplier = config.frame_multiplier
+    target_fps = fps * multiplier
+
+    # NVVFX effect determines actual output dimensions
+    act_w = processor.output_width or out_w
+    act_h = processor.output_height or out_h
+    out_frame_bytes = _frame_size_bytes(act_w, act_h)
+
+    # Interpolated frame size is still at source resolution
+    interp_frame_bytes = _frame_size_bytes(src_w, src_h)
+
+    encoder_opts = _build_encoder_opts(config, target_fps, act_w, act_h)
+
+    extra_kwargs: dict = {}
+    if os.name == "nt":
+        extra_kwargs["creationflags"] = 0x08000000
+
+    # Stage 1: ffmpeg decode + minterpolate → raw RGB24 stdout
+    minterp_filter = (
+        f"minterpolate=fps={target_fps}:mi_mode=mci:"
+        f"mc_mode=aobmc:me_mode=bidir:vsbmc=1"
+    )
+    decode_cmd = [
+        "ffmpeg", "-y",
+        "-hwaccel", "cuda",
+        "-i", input_path,
+        "-vf", minterp_filter,
+        "-fps_mode", "passthrough",
+        "-f", "rawvideo",
+        "-pix_fmt", "rgb24",
+        "-",
+    ]
+
+    # Stage 2: ffmpeg encode from raw RGB24 stdin
+    encode_cmd = [
+        "ffmpeg", "-y",
+        "-f", "rawvideo",
+        "-pixel_format", "rgb24",
+        "-video_size", f"{act_w}x{act_h}",
+        "-framerate", str(target_fps),
+        "-i", "-",
+    ]
+    if config.keep_audio:
+        encode_cmd += ["-i", input_path]
+    encode_cmd += encoder_opts
+    encode_cmd.append(output_path)
+
+    out_total = total_frames * multiplier
+    _frame_re = re.compile(r"frame=\s*(\d+)")
+
+    def _run_pipeline() -> None:
+        try:
+            dec_proc = subprocess.Popen(
+                decode_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                bufsize=1024 * 1024, **extra_kwargs,
+            )
+        except FileNotFoundError:
+            raise RuntimeError("未找到 ffmpeg，请安装 FFmpeg 并将其加入系统 PATH。")
+
+        try:
+            enc_proc = subprocess.Popen(
+                encode_cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE, bufsize=1024 * 1024, **extra_kwargs,
+            )
+        except FileNotFoundError:
+            dec_proc.kill()
+            dec_proc.wait()
+            raise RuntimeError("未找到 ffmpeg，请安装 FFmpeg 并将其加入系统 PATH。")
+
+        _drain_pipe(dec_proc, "stderr")
+        _drain_pipe(enc_proc, "stdout")
+        _spawn_cancel_watcher(cancel_event, dec_proc, enc_proc)
+
+        enc_stderr_lines: list[str] = []
+
+        def _read_stderr():
+            _last_pct = -1.0
+            _last_time = 0.0
+            try:
+                for line_bytes in iter(enc_proc.stderr.readline, b""):
+                    if cancel_event.is_set():
+                        break
+                    line = line_bytes.decode(errors="replace").rstrip()
+                    enc_stderr_lines.append(line)
+                    if out_total > 0:
+                        m = _frame_re.search(line)
+                        if m:
+                            cur = int(m.group(1))
+                            pct = min((cur / out_total) * 100.0, 99.0)
+                            now = time.monotonic()
+                            if pct - _last_pct >= 1.0 or now - _last_time >= 1.0:
+                                _last_pct = pct
+                                _last_time = now
+                                asyncio.run_coroutine_threadsafe(
+                                    progress_callback(pct, cur, out_total), loop
+                                )
+            except Exception:
+                pass
+
+        stderr_thread = threading.Thread(target=_read_stderr, daemon=True)
+        stderr_thread.start()
+
+        try:
+            frames_written = 0
+
+            while True:
+                _check_cancelled(cancel_event)
+
+                if HAS_CUPY and frames_written > 0 and frames_written % 100 == 0:
+                    _cp.get_default_memory_pool().free_all_blocks()
+
+                raw = b""
+                while len(raw) < interp_frame_bytes:
+                    chunk = dec_proc.stdout.read(interp_frame_bytes - len(raw))
+                    if not chunk:
+                        break
+                    raw += chunk
+                if len(raw) < interp_frame_bytes:
+                    break
+
+                arr = np.frombuffer(raw, dtype=np.uint8).reshape((src_h, src_w, 3))
+                result = processor.process_frame(arr)
+                enc_proc.stdin.write(result.tobytes())
+                enc_proc.stdin.flush()
+                frames_written += 1
+
+            try:
+                enc_proc.stdin.close()
+            except Exception:
+                pass
+
+            _check_cancelled(cancel_event)
+            enc_proc.wait()
+            stderr_thread.join(timeout=5)
+
+            if enc_proc.returncode != 0:
+                err_msg = "\n".join(enc_stderr_lines[-20:])
+                raise RuntimeError(
+                    f"ffmpeg 编码失败 (code {enc_proc.returncode}): {err_msg}"
+                )
+
+            task.current_frame = frames_written
+            task.total_frames = frames_written
+
+        except TaskCancelledError:
+            logger.info("Task %s: killing subprocesses", task.id)
+            try:
+                dec_proc.kill()
+            except Exception:
+                pass
+            try:
+                enc_proc.kill()
+            except Exception:
+                pass
+            stderr_thread.join(timeout=3)
+            raise
+        except Exception:
+            try:
+                dec_proc.kill()
+            except Exception:
+                pass
+            try:
+                enc_proc.kill()
+            except Exception:
+                pass
+            stderr_thread.join(timeout=3)
+            raise
+
+    await asyncio.wait_for(
+        loop.run_in_executor(None, _run_pipeline),
+        timeout=DEFAULT_TIMEOUT_SECONDS,
+    )
 
 
 # --------------- Main entry point ---------------
@@ -881,10 +1663,65 @@ async def process_task(
     _check_cancelled(cancel_event)
 
     # --- 2. Process ---
-    # NVVFX is usable when: SDK loaded + GPU lib available + GPU-accelerable modes selected
+    has_interp = ProcessMode.FRAME_INTERPOLATION in config.modes
+
+    # GPU-accelerable modes (SR, denoise, deblur, high_bitrate)
     gpu_modes = {ProcessMode.SUPER_RESOLUTION, ProcessMode.DENOISE, ProcessMode.DEBLUR, ProcessMode.HIGH_BITRATE}
     has_gpu_mode = bool(set(config.modes) & gpu_modes)
     want_nvvfx = HAS_NVVFX and _vfx_available and has_gpu_mode
+
+    # RIFE CLI availability for interpolation
+    want_rife = has_interp and HAS_RIFE
+
+    # --- Route to appropriate pipeline ---
+
+    if has_interp and want_rife:
+        # RIFE available → two-phase pipeline (with or without NVVFX)
+        processor = create_vfx_processor(config, src_w, src_h) if want_nvvfx else None
+        if want_nvvfx and processor is None:
+            logger.warning("Task %s: NVVFX init failed, using RIFE-only", task.id)
+        await _process_rife_pipeline(
+            task, config, processor, input_path, output_path,
+            src_w, src_h, out_w, out_h, fps,
+            total_frames, cancel_event, progress_callback,
+        )
+        task.status = TaskStatus.COMPLETED
+        logger.info("Task %s completed → %s", task.id, output_path)
+        return
+
+    elif has_interp and not want_rife:
+        # RIFE not available → fallback with ffmpeg minterpolate
+        logger.warning(
+            "Task %s: RIFE CLI not found, using ffmpeg minterpolate",
+            task.id,
+        )
+        if want_nvvfx:
+            processor = create_vfx_processor(config, src_w, src_h)
+        else:
+            processor = None
+
+        if processor is not None:
+            logger.info("Task %s: using NVVFX+minterpolate fallback pipeline", task.id)
+            try:
+                await _stream_process_fallback_interp_nvvfx(
+                    task, config, processor, input_path, output_path,
+                    src_w, src_h, out_w, out_h, fps,
+                    total_frames, cancel_event, progress_callback,
+                )
+            finally:
+                processor.close()
+        else:
+            logger.info("Task %s: using ffmpeg minterpolate fallback pipeline", task.id)
+            await _stream_process_fallback(
+                task, config, input_path, output_path,
+                src_w, src_h, out_w, out_h, fps,
+                total_frames, cancel_event, progress_callback,
+            )
+        task.status = TaskStatus.COMPLETED
+        logger.info("Task %s completed → %s", task.id, output_path)
+        return
+
+    # --- No interpolation: existing paths ---
 
     # Try to create NVVFX processor; fall back gracefully if GPU not ready
     processor = create_vfx_processor(config, src_w, src_h) if want_nvvfx else None

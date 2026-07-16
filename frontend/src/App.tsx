@@ -17,6 +17,7 @@ export default function App() {
     outputFormat: 'mp4',
     videoEncoder: 'h264_nvenc',
     batchSize: 4,
+    frameMultiplier: 2,
   });
 
   const handleMessage = useCallback((msg: WSMessage) => {

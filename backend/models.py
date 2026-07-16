@@ -20,6 +20,7 @@ class ProcessMode(str, enum.Enum):
     DENOISE = "denoise"
     DEBLUR = "deblur"
     HIGH_BITRATE = "high_bitrate"
+    FRAME_INTERPOLATION = "frame_interpolation"
 
 
 class QualityLevel(str, enum.Enum):
@@ -70,6 +71,7 @@ class TaskConfig:
     video_encoder: VideoEncoder = VideoEncoder.NVIDIA_H264
     batch_size: int = 4
     keep_audio: bool = True
+    frame_multiplier: int = 2  # 2x, 3x, 4x frame interpolation
 
 
 @dataclass
@@ -102,5 +104,6 @@ class Task:
                 "output_format": self.config.output_format.value,
                 "video_encoder": self.config.video_encoder.value,
                 "batch_size": self.config.batch_size,
+                "frame_multiplier": self.config.frame_multiplier,
             },
         }

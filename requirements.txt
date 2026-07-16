@@ -6,3 +6,4 @@ websockets==12.0
 nvidia-vfx
 numpy
 cupy-cuda12x  # GPU array library for NVVFX (or install torch instead)
+Pillow>=10.0.0  # fast PNG decode for RIFE frame merging pipeline

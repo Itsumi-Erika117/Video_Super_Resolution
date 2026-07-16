@@ -161,6 +161,7 @@ async def upload_videos(
     output_format: str = Form("mp4"),
     video_encoder: str = Form("h264_nvenc"),
     batch_size: int = Form(4),
+    frame_multiplier: int = Form(2),
 ):
     """Upload one or more video files and queue them for processing.
 
@@ -211,6 +212,7 @@ async def upload_videos(
                 output_format=OutputFormat(output_format),
                 video_encoder=VideoEncoder(video_encoder),
                 batch_size=batch_size,
+                frame_multiplier=frame_multiplier,
             )
         except ValueError as e:
             raise HTTPException(400, f"Invalid parameter: {e}")

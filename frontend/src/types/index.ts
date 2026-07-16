@@ -1,5 +1,5 @@
 export type TaskStatus = 'pending' | 'processing' | 'completed' | 'failed' | 'cancelled';
-export type ProcessMode = 'super_resolution' | 'denoise' | 'deblur' | 'high_bitrate';
+export type ProcessMode = 'super_resolution' | 'denoise' | 'deblur' | 'high_bitrate' | 'frame_interpolation';
 export type QualityLevel = 'low' | 'medium' | 'high' | 'ultra';
 export type OutputFormat = 'mp4' | 'mov' | 'avi' | 'mkv';
 export type VideoEncoder =
@@ -13,6 +13,7 @@ export interface TaskConfig {
   output_format: OutputFormat;
   video_encoder: VideoEncoder;
   batch_size: number;
+  frame_multiplier: number;
 }
 
 export interface Task {
@@ -46,4 +47,5 @@ export interface UploadSettings {
   outputFormat: OutputFormat;
   videoEncoder: VideoEncoder;
   batchSize: number;
+  frameMultiplier: number;
 }
