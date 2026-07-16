@@ -1,6 +1,6 @@
 # Video Super Resolution
 
-基于 **NVIDIA GPU** 的视频超分辨率/降噪/去模糊处理工具，支持多种处理模式自由组合，单次编码完成全部处理。
+基于 **NVIDIA GPU** 的视频超分辨率/降噪/去模糊/插帧处理工具，支持多种处理模式自由组合，单次编码完成全部处理。
 
 - 这只是一个本人用于学习AI生成代码的学习项目，因此其实有相当多可以继续完善的地方
 - 设计之初是为了快速的让我的磁盘中的老片变得更好看。 利用NVDIA的VFX可以更好的利用RTX显卡去处理这样的任务，而且速度更快
@@ -14,13 +14,15 @@
 - 🔇 **降噪** — AI 降噪（NVVFX）或同分辨率去噪（hqdn3d），适合低光照 / 老胶片素材
 - 🔎 **去模糊** — AI 去模糊（NVVFX）或同分辨率锐化（unsharp），修复轻微失焦
 - 📡 **高码率重编码** — AI 增强（NVVFX）或保留高质量源素材细节
-- ✅ **多模式自由组合** — 勾选超分 + 降噪 + 去模糊，一次性处理
-- ⚡ **GPU 硬件加速** — NVDEC 解码 + NVVFX AI 处理 + NVENC 编码，全链路 GPU
+- 🎞️ **AI 插帧** — RIFE (ncnn/Vulkan) 2×/3×/4× 帧率倍增，提升视频流畅度
+- ✅ **多模式自由组合** — 勾选超分 + 降噪 + 去模糊 + 插帧，一次性处理
+- ⚡ **GPU 硬件加速** — NVDEC 解码 + RIFE 插帧 + NVVFX AI 处理 + NVENC 编码，全链路 GPU
 - 📋 **任务队列** — 支持批量上传，FIFO 队列逐个处理
 - 🔄 **实时进度** — WebSocket 推送，处理进度条实时更新
 - 🚫 **随时取消** — 正在运行的任务可即时中止
-- 📁 **长视频友好** — 流式管道处理，无中间文件落盘，支持数小时视频
-- 🔄 **智能回退** — NVVFX 不可用时自动回退到 FFmpeg 软件滤镜方案
+- 📁 **长视频友好** — 流式管道处理，支持数小时视频
+- 🔄 **智能回退** — RIFE/NVVFX 不可用时自动回退到 FFmpeg 软件滤镜方案
+- 💾 **低磁盘占用** — 插帧管线：RIFE 完成后立即释放原始帧，仅保留插值帧（~5GB/2min视频）
 
 ## 技术栈
 
@@ -29,7 +31,8 @@
 | **后端框架** | FastAPI + Uvicorn |
 | **实时通信** | WebSocket |
 | **视频处理** | FFmpeg (NVDEC / NVENC) |
-| **AI 加速 SDK** | NVIDIA VFX SDK + CuPy（GPU 数组库） |
+| **AI 超分 SDK** | NVIDIA VFX SDK + CuPy（GPU 数组库） |
+| **AI 插帧** | RIFE v4.6 (ncnn/Vulkan) |
 | **AI 推理** | TensorRT 10 + cuDNN 9 + CUDA 12 运行时 |
 | **前端框架** | React 18 + TypeScript |
 | **样式** | Tailwind CSS |
@@ -43,7 +46,7 @@ vediosuperresolution/
 ├── backend/
 │   ├── main.py            # FastAPI 应用，REST + WebSocket
 │   ├── models.py          # 数据模型：Task / TaskConfig / 枚举
-│   ├── processing.py       # 核心处理管线（ffmpeg 流式管道）
+│   ├── processing.py       # 核心处理管线（ffmpeg 流式管道 + RIFE + NVVFX）
 │   └── queue_manager.py    # 任务队列管理（取消 / 暂停 / 广播）
 ├── frontend/
 │   ├── src/
@@ -60,6 +63,8 @@ vediosuperresolution/
 │   ├── index.html
 │   ├── package.json
 │   └── vite.config.ts
+├── tools/                 # 外部工具（需手动下载，不纳入版本控制）
+│   └── rife-ncnn-vulkan/  # RIFE CLI + AI 模型（~430MB）
 ├── uploads/               # 上传文件暂存目录
 ├── output/                # 处理完成输出目录
 ├── requirements.txt       # Python 依赖
@@ -87,10 +92,20 @@ vediosuperresolution/
 | **CUDA 运行时** | 12.x | NVIDIA VFX SDK 编译依赖 |
 | **cuDNN** | 9.x | TensorRT 推理依赖 |
 | **CuPy** | 14.x (cuda12x) | GPU 数组库，DLPack 桥接 |
+| **Vulkan 运行时** | 1.1+ | RIFE 插帧 GPU 加速（随显卡驱动安装） |
+
+### RIFE 插帧工具
+
+插帧功能依赖 rife-ncnn-vulkan CLI 工具，需手动下载：
+
+1. 从 [GitHub Releases](https://github.com/nihui/rife-ncnn-vulkan/releases) 下载 Windows 版本
+2. 解压到 `tools/rife-ncnn-vulkan/` 目录
+3. 确保目录下包含 `rife-ncnn-vulkan.exe` 和 `models/`（rife-v4.6等）文件夹
 
 > **注意**：
 > - NVVFX SDK 可用时，超分、降噪、去模糊、高码率均使用 AI 模型处理
-> - NVVFX 不可用时，自动回退到 FFmpeg 内置滤镜（lanczos 缩放 / hqdn3d 降噪 / unsharp 锐化）
+> - RIFE CLI 可用时，插帧使用 RIFE v4.6 模型（GPU Vulkan 加速）
+> - NVVFX / RIFE 不可用时，自动回退到 FFmpeg 内置滤镜（lanczos 缩放 / hqdn3d 降噪 / unsharp 锐化 / minterpolate 插帧）
 > - 首次运行 NVVFX 时 SDK 需要在线下载 AI 模型到本地缓存（~1-2 GB）
 
 ## 快速开始
@@ -155,14 +170,16 @@ npm run dev
 | 🔇 降噪 | 同分辨率降噪 |
 | 🔎 去模糊 | 同分辨率锐化 |
 | 📡 高码率 | 高质量重编码 |
+| 🎞️ 插帧 | 2×/3×/4× 帧率倍增（RIFE AI 插帧） |
 
-> **提示**：多选时 FFmpeg 在单次编码中按 **超分 → 降噪 → 去模糊** 顺序串行应用滤镜。
+> **提示**：多选时处理顺序为 **插帧 → 超分 → 降噪 → 去模糊**。
 
 ### 2. 配置参数
 
 | 参数 | 可选值 |
 |------|--------|
 | 放大倍数 | 1×, 2×, 3×, 4×（仅超分模式） |
+| 插帧倍数 | 2×, 3×, 4×（仅插帧模式，如 30fps → 60fps） |
 | 质量等级 | LOW / MEDIUM / HIGH / ULTRA |
 | 输出格式 | MP4, MOV, AVI, MKV |
 | 编码器 | NVENC H.264 / HEVC（GPU），libx264 / libx265 / VP9（CPU） |
@@ -188,21 +205,29 @@ npm run dev
 ## 处理管线
 
 ```
-上传视频 → ffprobe 元数据探测 → 流式管道处理 → 输出文件
+上传视频 → ffprobe 元数据探测 → 处理管线 → 输出文件
                                           │
-                    ┌─────────────────────┼─────────────────────┐
-                    ▼                                           ▼
-            NVVFX 路径 (GPU)                            Fallback 路径
-    ffmpeg NVDEC → raw RGB24 →                   ffmpeg 单命令：
-    CuPy GPU 张量 → NVVFX AI →                   -hwaccel cuda + 滤镜链
-    raw RGB24 → ffmpeg NVENC                     (lanczos/hqdn3d/unsharp)
+          ┌───────────────────────────────┼───────────────────────────────┐
+          ▼                               ▼                               ▼
+   RIFE 插帧路径                     NVVFX 路径                    Fallback 路径
+   (先于超分执行)                   (GPU AI 处理)                 (软件滤镜)
+
+Phase 1: ffmpeg 软件解码          ffmpeg → raw RGB24 →      ffmpeg 单命令：
+         提取帧 → orig_dir/       CuPy GPU 张量 →           滤镜链 (minterpolate
+Phase 2: rife-ncnn-vulkan        NVVFX AI 处理 →           / lanczos / hqdn3d
+         CLI 目录模式插帧         raw RGB24 →               / unsharp)
+         → interp_dir/           ffmpeg NVENC 编码          + NVENC 编码
+Phase 3: 删除 orig_dir
+         ffmpeg 管道原视频 + PIL 读插值帧
+         → 交叠 → NVVFX → 编码
 ```
 
+- **RIFE 管线**：软件解码提取帧 → RIFE v4.6 Vulkan GPU 插帧 → 释放原始帧节省空间 → 管道读取原视频 + 插值帧交叠编码
 - **NVVFX 管线**：解码 → GPU 张量转换(CuPy) → NVIDIA VFX SDK AI 处理 → 编码，全链路 GPU
 - **Fallback 管线**：FFmpeg 内置滤镜链，NVENC 硬件编码
-- **无中间文件**：帧数据通过内存管道传输，支持任意长度视频
+- **智能回退**：SDK 初始化失败时自动切换至 Fallback，不中断任务
+- **流式优先**：原视频帧通过管道传输，插值帧通过 PIL 顺序读取，减少磁盘 I/O
 - **进度节流**：每 1% 或每秒更新一次进度，避免大视频时事件循环拥塞
-- **智能回退**：NVVFX 初始化失败时自动切换至 Fallback，不中断任务
 
 ## API 概览
 
@@ -230,9 +255,36 @@ npm run dev
 | `output_format` | string | 输出格式：`mp4`/`mov`/`avi`/`mkv` |
 | `video_encoder` | string | 编码器：`h264_nvenc`/`hevc_nvenc`/`libx264`/`libx265`/`libvpx-vp9` |
 | `batch_size` | int | GPU 批处理大小（1–16） |
+| `frame_multiplier` | int | 插帧倍数（2–4，仅插帧模式） |
 
 
 ## 更新日志
+
+### v1.2 (2026-07-17)
+
+**RIFE AI 插帧功能**
+
+集成 RIFE (Real-Time Intermediate Flow Estimation) 插帧引擎，支持 2×/3×/4× 帧率倍增。
+
+**新增功能：**
+
+- 🎞️ **AI 插帧模式**：基于 RIFE v4.6 模型（ncnn/Vulkan GPU 加速），支持 2×/3×/4× 帧率倍增
+- 🔄 **多级降级策略**：RIFE CLI 不可用 → ffmpeg minterpolate 滤镜；NVVFX 不可用 → ffmpeg 软件滤镜
+- 💾 **流式优化**：RIFE 完成后立即释放原始帧（节省 ~50% 磁盘空间），原视频帧通过 ffmpeg 管道读取（零磁盘随机 I/O）
+- 🖥️ **前端 UI**：插帧模式选择按钮 + 倍数调节器（2×/3×/4×）
+
+**技术细节：**
+
+- RIFE CLI 通过子进程调用，目录模式批量处理帧对
+- `-n` 参数语义为"目标插值帧总数"，公式：`(multiplier-1) × (输入帧数-1)`
+- 帧提取使用软件解码（`-r {fps}` 输出选项），避免硬件解码 B 帧重排问题
+- 编码命令与 NVVFX 管线保持一致，仅依赖 `-framerate` 不额外加 `-r`
+
+**已知限制：**
+
+- RIFE CLI 需手动下载（~430MB），置于 `tools/rife-ncnn-vulkan/`
+- RIFE 仅支持 2×/3×/4× 倍数插帧
+- 插帧管线需要 Pillow 库读取中间 PNG 帧
 
 ### v1.1 (2026-07-16)
 

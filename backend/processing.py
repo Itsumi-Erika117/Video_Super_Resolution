@@ -1177,61 +1177,27 @@ async def _process_rife_pipeline(
             )
 
         # === Phase 3: Encode (70-100%) ===
-        # Merge frames with hardlinks (instant, no data copy), then read
-        # with PIL directly instead of another ffmpeg decode process.
-        # This eliminates the disk I/O bottleneck from re-decoding
-        # thousands of PNGs through a separate ffmpeg instance.
+        # Free disk space: delete original frames now that RIFE is done.
+        # Phase 3 sources original frames from the video via ffmpeg pipe
+        # (sequential, fast), and interpolated frames from interp_dir.
+        _shutil_mod.rmtree(orig_dir, ignore_errors=True)
+        logger.info("Freed orig_dir, kept %d interpolated frames", len(interp_files))
 
         try:
             from PIL import Image as _PILImage
             _HAS_PIL = True
         except ImportError:
             _HAS_PIL = False
-            logger.warning("Pillow not installed – falling back to ffmpeg for PNG decode")
+            logger.warning("Pillow not installed")
 
-        merged_dir = os.path.join(base_tmp, "merged")
-        os.makedirs(merged_dir, exist_ok=True)
-
-        def _link_or_copy(src: str, dst: str) -> None:
-            """Create hardlink (instant) or fallback copy if cross-device."""
-            try:
-                os.link(src, dst)
-            except OSError:
-                _shutil_mod.copy2(src, dst)
-
-        # Interleave: orig0, interp(0,1)[0..k-1], orig1, interp(1,2)[0..k-1], ...
-        interp_idx = 0
-        frame_num = 1
-        for i, orig_fname in enumerate(orig_files):
-            _link_or_copy(
-                os.path.join(orig_dir, orig_fname),
-                os.path.join(merged_dir, f"{frame_num:08d}.png"),
-            )
-            frame_num += 1
-
-            if i < len(orig_files) - 1:
-                for k in range(interp_per_pair):
-                    if interp_idx < len(interp_files):
-                        _link_or_copy(
-                            os.path.join(interp_dir, interp_files[interp_idx]),
-                            os.path.join(merged_dir, f"{frame_num:08d}.png"),
-                        )
-                        frame_num += 1
-                        interp_idx += 1
-
-        total_merged = frame_num - 1
-        logger.info("Merged %d frames into %s (hardlinks)", total_merged, merged_dir)
-
-        if not _HAS_PIL:
-            # Fallback: ffmpeg image2 demuxer
-            decode2_cmd = [
-                "ffmpeg", "-y",
-                "-framerate", str(out_fps),
-                "-i", os.path.join(merged_dir, "%08d.png"),
-                "-f", "rawvideo",
-                "-pix_fmt", "rgb24",
-                "-",
-            ]
+        # ffmpeg decode: original video → raw RGB24 pipe
+        decode_orig_cmd = [
+            "ffmpeg", "-y",
+            "-i", input_path,
+            "-f", "rawvideo",
+            "-pix_fmt", "rgb24",
+            "-",
+        ]
 
         encode_cmd = [
             "ffmpeg", "-y",
@@ -1246,22 +1212,17 @@ async def _process_rife_pipeline(
         encode_cmd += encoder_opts
         encode_cmd.append(output_path)
 
-        logger.info("Phase 3: streaming %d frames (PIL=%s)→NVVFX→encode", total_merged, _HAS_PIL)
+        logger.info("Phase 3: pipe+interp→NVVFX→encode, %d interp frames", len(interp_files))
 
         def _run_encode() -> None:
-            """Phase 3 worker: read frames → NVVFX → encode."""
-            if _HAS_PIL:
-                # PIL path: read PNGs directly, no ffmpeg decode overhead
-                dec2_proc = None
-            else:
-                # ffmpeg fallback
-                try:
-                    dec2_proc = subprocess.Popen(
-                        decode2_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                        bufsize=1024 * 1024, **extra_kwargs,
-                    )
-                except FileNotFoundError:
-                    raise RuntimeError("未找到 ffmpeg")
+            """Phase 3: read orig via pipe + interp via PIL, interleave, encode."""
+            try:
+                dec_proc = subprocess.Popen(
+                    decode_orig_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                    bufsize=1024 * 1024, **extra_kwargs,
+                )
+            except FileNotFoundError:
+                raise RuntimeError("未找到 ffmpeg")
 
             try:
                 enc_proc = subprocess.Popen(
@@ -1269,15 +1230,13 @@ async def _process_rife_pipeline(
                     stderr=subprocess.PIPE, bufsize=1024 * 1024, **extra_kwargs,
                 )
             except FileNotFoundError:
-                if dec2_proc:
-                    dec2_proc.kill()
-                    dec2_proc.wait()
+                dec_proc.kill()
+                dec_proc.wait()
                 raise RuntimeError("未找到 ffmpeg")
 
-            if dec2_proc:
-                _drain_pipe(dec2_proc, "stderr")
+            _drain_pipe(dec_proc, "stderr")
             _drain_pipe(enc_proc, "stdout")
-            _spawn_cancel_watcher(cancel_event, enc_proc, *([dec2_proc] if dec2_proc else []))
+            _spawn_cancel_watcher(cancel_event, dec_proc, enc_proc)
 
             enc_stderr_lines: list[str] = []
 
@@ -1310,55 +1269,52 @@ async def _process_rife_pipeline(
 
             try:
                 frames_written = 0
+                interp_idx = 0
+                prev_orig: Optional["np.ndarray"] = None
 
-                if _HAS_PIL:
-                    # Read merged frames directly with PIL (fast, sequential)
-                    for frame_num in range(1, total_merged + 1):
-                        _check_cancelled(cancel_event)
+                while True:
+                    _check_cancelled(cancel_event)
 
-                        if HAS_CUPY and frames_written > 0 and frames_written % 100 == 0:
-                            _cp.get_default_memory_pool().free_all_blocks()
+                    if HAS_CUPY and frames_written > 0 and frames_written % 100 == 0:
+                        _cp.get_default_memory_pool().free_all_blocks()
 
-                        fpath = os.path.join(merged_dir, f"{frame_num:08d}.png")
-                        try:
-                            with _PILImage.open(fpath) as pil_img:
-                                arr = np.array(pil_img.convert("RGB"))
-                        except Exception as exc:
-                            raise RuntimeError(f"读取帧 {fpath} 失败: {exc}") from exc
-
-                        if has_nvvfx:
-                            result = processor.process_frame(arr)
-                            enc_proc.stdin.write(result.tobytes())
-                        else:
-                            enc_proc.stdin.write(arr.tobytes())
-                        enc_proc.stdin.flush()
-                        frames_written += 1
-                else:
-                    # ffmpeg pipe fallback
-                    while True:
-                        _check_cancelled(cancel_event)
-
-                        if HAS_CUPY and frames_written > 0 and frames_written % 100 == 0:
-                            _cp.get_default_memory_pool().free_all_blocks()
-
-                        raw = b""
-                        while len(raw) < in_frame_bytes:
-                            chunk = dec2_proc.stdout.read(in_frame_bytes - len(raw))
-                            if not chunk:
-                                break
-                            raw += chunk
-                        if len(raw) < in_frame_bytes:
+                    raw = b""
+                    while len(raw) < in_frame_bytes:
+                        chunk = dec_proc.stdout.read(in_frame_bytes - len(raw))
+                        if not chunk:
                             break
+                        raw += chunk
+                    if len(raw) < in_frame_bytes:
+                        break
 
-                        arr = np.frombuffer(raw, dtype=np.uint8).reshape((src_h, src_w, 3))
+                    curr = np.frombuffer(raw, dtype=np.uint8).reshape((src_h, src_w, 3))
 
-                        if has_nvvfx:
-                            result = processor.process_frame(arr)
-                            enc_proc.stdin.write(result.tobytes())
-                        else:
-                            enc_proc.stdin.write(arr.tobytes())
-                        enc_proc.stdin.flush()
-                        frames_written += 1
+                    # Write interpolated between prev and curr (skip first frame)
+                    if prev_orig is not None:
+                        for k in range(interp_per_pair):
+                            if interp_idx < len(interp_files):
+                                ipath = os.path.join(interp_dir, interp_files[interp_idx])
+                                if _HAS_PIL:
+                                    with _PILImage.open(ipath) as pil_img:
+                                        iarr = np.array(pil_img.convert("RGB"))
+                                else:
+                                    iarr = np.frombuffer(
+                                        open(ipath, "rb").read(), dtype=np.uint8
+                                    ).reshape((src_h, src_w, 3))
+                                if has_nvvfx:
+                                    iarr = processor.process_frame(iarr)
+                                enc_proc.stdin.write(iarr.tobytes())
+                                enc_proc.stdin.flush()
+                                frames_written += 1
+                                interp_idx += 1
+
+                    # Write current original
+                    if has_nvvfx:
+                        curr = processor.process_frame(curr)
+                    enc_proc.stdin.write(curr.tobytes())
+                    enc_proc.stdin.flush()
+                    frames_written += 1
+                    prev_orig = curr
 
                 try:
                     enc_proc.stdin.close()
@@ -1380,8 +1336,7 @@ async def _process_rife_pipeline(
 
             except TaskCancelledError:
                 try:
-                    if dec2_proc:
-                        dec2_proc.kill()
+                    dec_proc.kill()
                 except Exception:
                     pass
                 try:
@@ -1392,8 +1347,7 @@ async def _process_rife_pipeline(
                 raise
             except Exception:
                 try:
-                    if dec2_proc:
-                        dec2_proc.kill()
+                    dec_proc.kill()
                 except Exception:
                     pass
                 try:
