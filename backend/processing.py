@@ -234,8 +234,12 @@ class VFXProcessor:
         gpu = self._to_gpu(frame)
         for effect in self._effects:
             output = effect.run(gpu)
-            gpu = self._from_dlpack(output.image)
-        return self._to_numpy(gpu)
+            new_gpu = self._from_dlpack(output.image)
+            del gpu  # free previous GPU tensor
+            gpu = new_gpu
+        result = self._to_numpy(gpu)
+        del gpu  # free final GPU tensor
+        return result
 
     def process_batch(self, frames: list["np.ndarray"]) -> list["np.ndarray"]:
         """Process a batch of frames (processes individually; batch_size=1 recommended)."""
@@ -696,6 +700,10 @@ async def _stream_process_nvvfx(
             while True:
                 _check_cancelled(cancel_event)
 
+                # Periodic CuPy GPU memory pool cleanup (every 100 frames)
+                if HAS_CUPY and frames_processed > 0 and frames_processed % 100 == 0:
+                    _cp.get_default_memory_pool().free_all_blocks()
+
                 # Read one raw frame from decoder stdout
                 raw = b""
                 while len(raw) < in_frame_bytes:
@@ -883,11 +891,15 @@ async def process_task(
 
     if processor is not None:
         logger.info("Task %s: using NVVFX streaming pipeline", task.id)
-        await _stream_process_nvvfx(
-            task, config, processor, input_path, output_path,
-            src_w, src_h, out_w, out_h, fps,
-            total_frames, cancel_event, progress_callback,
-        )
+        try:
+            await _stream_process_nvvfx(
+                task, config, processor, input_path, output_path,
+                src_w, src_h, out_w, out_h, fps,
+                total_frames, cancel_event, progress_callback,
+            )
+        finally:
+            processor.close()
+            logger.info("Task %s: NVVFX processor released", task.id)
     else:
         if want_nvvfx:
             logger.warning("Task %s: NVVFX init failed, falling back to ffmpeg pipeline", task.id)
